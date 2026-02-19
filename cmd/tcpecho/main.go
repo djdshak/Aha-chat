@@ -15,7 +15,7 @@ func main(){
 	log.Println("listening on 127.0.0.1:9090")
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := ln.Accept()·
 		if err != nil {
 			log.Println("accept:", err)
 			continue;
