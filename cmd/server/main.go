@@ -104,13 +104,17 @@ func main() {
 /* -------------------- WebSocket + Hub -------------------- */
 
 type WSIn struct {
-	Type string `json:"type"` // "msg"
-	To   string `json:"to,omitempty"`
-	Text string `json:"text,omitempty"`
+	Type  string `json:"type"` // "msg"
+	MsgID string `json:"msg_id,omitempty"`
+	To    string `json:"to,omitempty"`
+	Text  string `json:"text,omitempty"`
 }
 
 type WSOut struct {
-	Type string `json:"type"` // "msg", "info", "error"
+	Type  string `json:"type"` // "msg", "info", "error"
+	MsgID string `json:"msg_id,omitempty"`
+	Ack   string `json:"ack,omitempty"`
+
 	From string `json:"from,omitempty"`
 	To   string `json:"to,omitempty"`
 	Text string `json:"text,omitempty"`
@@ -164,10 +168,11 @@ func wsHandler(hub *Hub) http.HandlerFunc {
 }
 
 type sendReq struct {
-	to      string
-	msg     []byte
-	from    *Client
-	offline []byte
+	to        string
+	msg       []byte
+	from      *Client
+	offline   []byte
+	delivered []byte
 }
 
 type Hub struct {
@@ -229,12 +234,32 @@ func (h *Hub) run() {
 
 			select {
 			case dst.send <- req.msg:
+				if req.from != nil && req.delivered != nil {
+					select {
+					case req.from.send <- req.delivered:
+					default:
+					}
+				}
 			default:
 				delete(h.clients, dst)
 				if cur, ok2 := h.byUser[dst.username]; ok2 && cur == dst {
 					delete(h.byUser, dst.username)
 				}
 				close(dst.send)
+
+				//给发送者回一个错误，表示投递失败 (optional)
+				if req.from != nil {
+					fail, _ := json.Marshal(WSOut{
+						Type:  "error",
+						MsgID: "",
+						Text:  "delivery failed: receiver connection is slow/closed",
+						Ts:    time.Now().Unix(),
+					})
+					select {
+					case req.from.send <- fail:
+					default:
+					}
+				}
 			}
 
 		case msg := <-h.broadcast:
@@ -285,36 +310,84 @@ func (c *Client) readPump() {
 		case "msg":
 			now := time.Now().Unix()
 
+			// 1) 基本清洗
+			to := strings.TrimSpace(in.To)
+			text := strings.TrimSpace(in.Text)
+			msgID := strings.TrimSpace(in.MsgID)
+
+			// 2) 最小 ACK 版本建议：要求客户端带 msg_id
+			if msgID == "" {
+				_ = c.enqueueJSON(WSOut{
+					Type: "error",
+					Text: "missing msg_id",
+					Ts:   now,
+				})
+				continue
+			}
+
+			if text == "" {
+				_ = c.enqueueJSON(WSOut{
+					Type:  "error",
+					MsgID: msgID,
+					Text:  "empty text",
+					Ts:    now,
+				})
+				continue
+			}
+
+			// 3) 先回 server_received ACK（表示服务器已收到并解析）
+			_ = c.enqueueJSON(WSOut{
+				Type:  "msg",
+				MsgID: msgID,
+				Ack:   "server_received",
+				To:    to,
+				Ts:    now,
+			})
+
+			// 4) 组装真正的消息（发给接收方，也给发送者回显）
 			out := WSOut{
-				Type: "msg",
-				From: c.username,
-				To:   strings.TrimSpace(in.To),
-				Text: in.Text,
-				Ts:   now,
+				Type:  "msg",
+				MsgID: msgID,
+				From:  c.username,
+				To:    to,
+				Text:  text,
+				Ts:    now,
 			}
 			b, _ := json.Marshal(out)
 
+			// 5) 发给发送者自己回显（UI 可立即显示）
 			select {
 			case c.send <- b:
 			default:
 			}
 
+			// 6) 如果没填 to，仍走广播
 			if out.To == "" {
 				c.hub.broadcast <- b
 				continue
 			}
 
-			off, _ := json.Marshal(WSOut{
-				Type: "error",
-				Text: "user offline: " + out.To,
-				Ts:   now,
+			deliveredAck, _ := json.Marshal(WSOut{
+				Type:  "ack",
+				MsgID: msgID,
+				Ack:   "delivered",
+				To:    to,
+				Ts:    time.Now().Unix(),
+			})
+
+			offlineErr, _ := json.Marshal(WSOut{
+				Type:  "error",
+				MsgID: msgID,
+				Text:  "user offline: " + to,
+				Ts:    time.Now().Unix(),
 			})
 
 			c.hub.sendTo <- sendReq{
-				to:      out.To,
-				msg:     b,
-				from:    c,
-				offline: off,
+				to:        to,
+				msg:       b,
+				from:      c,
+				offline:   offlineErr,
+				delivered: deliveredAck,
 			}
 		}
 	}
