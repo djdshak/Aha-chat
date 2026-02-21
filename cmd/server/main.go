@@ -105,12 +105,14 @@ func main() {
 
 type WSIn struct {
 	Type string `json:"type"` // "msg"
+	To   string `json:"to,omitempty"`
 	Text string `json:"text,omitempty"`
 }
 
 type WSOut struct {
 	Type string `json:"type"` // "msg", "info", "error"
 	From string `json:"from,omitempty"`
+	To   string `json:"to,omitempty"`
 	Text string `json:"text,omitempty"`
 	Ts   int64  `json:"ts,omitempty"`
 }
@@ -161,19 +163,31 @@ func wsHandler(hub *Hub) http.HandlerFunc {
 	}
 }
 
+type sendReq struct {
+	to      string
+	msg     []byte
+	from    *Client
+	offline []byte
+}
+
 type Hub struct {
 	clients    map[*Client]bool
+	byUser     map[string]*Client
 	register   chan *Client
 	unregister chan *Client
 	broadcast  chan []byte
+
+	sendTo chan sendReq
 }
 
 func newHub() *Hub {
 	return &Hub{
 		clients:    make(map[*Client]bool),
+		byUser:     make(map[string]*Client),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		broadcast:  make(chan []byte, 256),
+		sendTo:     make(chan sendReq, 256),
 	}
 }
 
@@ -181,14 +195,46 @@ func (h *Hub) run() {
 	for {
 		select {
 		case c := <-h.register:
+			if old, ok := h.byUser[c.username]; ok && old != c {
+				if _, ok2 := h.clients[old]; ok2 {
+					delete(h.clients, old)
+					close(old.send)
+				}
+			}
 			h.clients[c] = true
+			h.byUser[c.username] = c
 			log.Printf("ws: user %s connected (online=%d)", c.username, len(h.clients))
 
 		case c := <-h.unregister:
 			if _, ok := h.clients[c]; ok {
 				delete(h.clients, c)
+				if cur, ok2 := h.byUser[c.username]; ok2 && cur == c {
+					delete(h.byUser, c.username)
+				}
 				close(c.send)
 				log.Printf("ws: user %s disconnected (online=%d)", c.username, len(h.clients))
+			}
+
+		case req := <-h.sendTo:
+			dst, ok := h.byUser[req.to]
+			if !ok {
+				if req.from != nil && req.offline != nil {
+					select {
+					case req.from.send <- req.offline:
+					default:
+					}
+				}
+				continue
+			}
+
+			select {
+			case dst.send <- req.msg:
+			default:
+				delete(h.clients, dst)
+				if cur, ok2 := h.byUser[dst.username]; ok2 && cur == dst {
+					delete(h.byUser, dst.username)
+				}
+				close(dst.send)
 			}
 
 		case msg := <-h.broadcast:
@@ -198,6 +244,9 @@ func (h *Hub) run() {
 				default:
 					// 发送队列满了：踢掉这个慢客户端
 					delete(h.clients, c)
+					if cur, ok2 := h.byUser[c.username]; ok2 && cur == c {
+						delete(h.byUser, c.username)
+					}
 					close(c.send)
 				}
 			}
@@ -234,17 +283,39 @@ func (c *Client) readPump() {
 
 		switch in.Type {
 		case "msg":
+			now := time.Now().Unix()
+
 			out := WSOut{
 				Type: "msg",
 				From: c.username,
+				To:   strings.TrimSpace(in.To),
 				Text: in.Text,
-				Ts:   time.Now().Unix(),
+				Ts:   now,
 			}
 			b, _ := json.Marshal(out)
-			c.hub.broadcast <- b
 
-		default:
-			_ = c.enqueueJSON(WSOut{Type: "error", Text: "unknown type", Ts: time.Now().Unix()})
+			select {
+			case c.send <- b:
+			default:
+			}
+
+			if out.To == "" {
+				c.hub.broadcast <- b
+				continue
+			}
+
+			off, _ := json.Marshal(WSOut{
+				Type: "error",
+				Text: "user offline: " + out.To,
+				Ts:   now,
+			})
+
+			c.hub.sendTo <- sendReq{
+				to:      out.To,
+				msg:     b,
+				from:    c,
+				offline: off,
+			}
 		}
 	}
 }
