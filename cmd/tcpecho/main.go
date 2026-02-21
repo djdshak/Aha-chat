@@ -1,12 +1,12 @@
 package main
 
-import(
+import (
 	"io"
 	"log"
 	"net"
 )
 
-func main(){
+func main() {
 	ln, err := net.Listen("tcp", "127.0.0.1:9090")
 	if err != nil {
 		log.Fatal(err)
@@ -15,10 +15,10 @@ func main(){
 	log.Println("listening on 127.0.0.1:9090")
 
 	for {
-		conn, err := ln.Accept()·
+		conn, err := ln.Accept()
 		if err != nil {
 			log.Println("accept:", err)
-			continue;
+			continue
 		}
 
 		log.Println("accepted:", conn.RemoteAddr())
