@@ -10,4 +10,8 @@ func registerRoutes(mux *http.ServeMux, hub *Hub) {
 
 	// WebSocket
 	mux.HandleFunc("/v1/ws", wsHandler(hub))
+
+	// DB read APIs
+	mux.HandleFunc("/v1/history", historyHandler)
+	mux.HandleFunc("/v1/sync", syncHandler)
 }

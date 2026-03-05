@@ -10,6 +10,18 @@ import (
 func main() {
 	addr := getenv("LISTEN_ADDR", "127.0.0.1:8080")
 
+	dbPath := getenv("DB_PATH", "aha_chat.db")
+	if err := InitDB(dbPath); err != nil {
+		log.Fatalf("init db failed: %v", err)
+	}
+
+	defer func() {
+		if err := CloseDB(); err != nil {
+			log.Printf("close db: %v", err)
+		}
+	}()
+	log.Println("sqlite ready:", dbPath)
+
 	// 1) 核心组件
 	hub := newHub()
 	go hub.run()

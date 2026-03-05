@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
@@ -77,6 +78,25 @@ func (c *Client) readPump() {
 				Ts:    now,
 			})
 
+			// 先落库（幂等）
+			_, inserted, err := StoreTextMessage(
+				context.Background(),
+				msgID,
+				c.username,
+				to,
+				text,
+				now,
+			)
+			if err != nil {
+				_ = c.enqueueJSON(WSOut{
+					Type:  "error",
+					MsgID: msgID,
+					Text:  "db insert failed",
+					Ts:    time.Now().Unix(),
+				})
+				continue
+			}
+
 			// 4) 组装真正消息（发给接收方，也给发送者回显）
 			out := WSOut{
 				Type:  "msg",
@@ -86,6 +106,10 @@ func (c *Client) readPump() {
 				Text:  text,
 				Ts:    now,
 			}
+			if !inserted {
+				continue
+			}
+
 			b, _ := json.Marshal(out)
 
 			// 5) 发给发送者自己回显（UI 可立即显示）
