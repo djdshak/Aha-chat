@@ -14,4 +14,7 @@ func registerRoutes(mux *http.ServeMux, hub *Hub) {
 	// DB read APIs
 	mux.HandleFunc("/v1/history", historyHandler)
 	mux.HandleFunc("/v1/sync", syncHandler)
+
+	//
+	mux.HandleFunc("/v1/register", registerHandler)
 }

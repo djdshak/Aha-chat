@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -16,10 +17,15 @@ var upgrader = websocket.Upgrader{
 func wsHandler(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// token：先用 query 参数，最省事
-		token := r.URL.Query().Get("token")
-		username, ok := usernameFromToken(token)
-		if !ok {
-			http.Error(w, "unauthorized (missing/invalid token)", http.StatusUnauthorized)
+		token := strings.TrimSpace(r.URL.Query().Get("token"))
+		if token == "" {
+			http.Error(w, "missing token", http.StatusUnauthorized)
+			return
+		}
+
+		username, err := UsernameByToken(r.Context(), token)
+		if err != nil {
+			http.Error(w, "invalid token "+err.Error(), http.StatusUnauthorized)
 			return
 		}
 

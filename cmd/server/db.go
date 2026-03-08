@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var appDB *sql.DB
@@ -65,6 +71,21 @@ func InitDB(dbPath string) error {
 			ON messages(to_user, id);`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_pair_id
 			ON messages(from_user, to_user, id);`,
+		`CREATE TABLE IF NOT EXISTS users (
+    		id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT NOT NULL UNIQUE,
+			password_hash BLOB NOT NULL,
+			created_at INTEGER NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS tokens (
+			token TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_tokens_user_id ON tokens(user_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_tokens_expires_at ON tokens(expires_at);`,
 	}
 
 	for _, q := range schema {
@@ -75,6 +96,7 @@ func InitDB(dbPath string) error {
 	}
 
 	appDB = db
+	log.Printf("InitDB ok: appDB=%p", appDB)
 	return nil
 }
 
@@ -238,4 +260,137 @@ func reverseMessages(a []MessageRow) {
 	for i, j := 0, len(a)-1; i < j; i, j = i+1, j-1 {
 		a[i], a[j] = a[j], a[i]
 	}
+}
+
+// 注册和登陆 tokens
+
+type AuthUser struct {
+	ID       int64
+	Username string
+}
+
+func CreateUser(ctx context.Context, username, password string) error {
+	if appDB == nil {
+		return errors.New("db not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("empty username")
+	}
+	if len(password) < 6 {
+		return errors.New("password too short (min 6)")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("bcrypt: %w", err)
+	}
+
+	_, err = appDB.ExecContext(ctx,
+		`INSERT INTO users (username, password_hash, created_at)
+        VALUES (?, ?, ?)`,
+		username, hash, time.Now().Unix(),
+	)
+
+	if err != nil {
+		return fmt.Errorf("insert user: %w", err)
+	}
+	return nil
+}
+
+func AuthenticateUser(ctx context.Context, username, password string) (AuthUser, error) {
+	if appDB == nil {
+		return AuthUser{}, errors.New("db not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return AuthUser{}, errors.New("empty username")
+	}
+
+	var (
+		id   int64
+		hash []byte
+	)
+
+	err := appDB.QueryRowContext(ctx,
+		`SELECT id, password_hash FROM users WHERE username = ?`,
+		username).Scan(&id, &hash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AuthUser{}, errors.New("invalid username or password")
+		}
+		return AuthUser{}, fmt.Errorf("query user: %w", err)
+	}
+
+	if err := bcrypt.CompareHashAndPassword(hash, []byte(password)); err != nil {
+		return AuthUser{}, errors.New("invalid username or password")
+	}
+
+	return AuthUser{ID: id, Username: username}, nil
+}
+
+func IssueToken(ctx context.Context, userID int64, ttl time.Duration) (token string,
+	expiresAt int64, err error) {
+	if appDB == nil {
+		return "", 0, errors.New("db not initialized")
+	}
+	token, err = newTokenString(32)
+	if err != nil {
+		return "", 0, err
+	}
+
+	now := time.Now().Unix()
+	expiresAt = now + int64(ttl.Seconds())
+
+	_, err = appDB.ExecContext(ctx,
+		`INSERT INTO tokens (token, user_id, created_at, expires_at) 
+		VALUES (?, ?, ?, ?)`,
+		token, userID, now, expiresAt)
+	if err != nil {
+		return "", 0, fmt.Errorf("insert token: %w", err)
+	}
+	return token, expiresAt, nil
+}
+
+func UsernameByToken(ctx context.Context, token string) (string, error) {
+	if appDB == nil {
+		return "", errors.New("db not initialized")
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", errors.New("empty token")
+	}
+
+	var (
+		username  string
+		expiresAt int64
+	)
+
+	err := appDB.QueryRowContext(ctx,
+		`SELECT u.username, t.expires_at
+		 FROM tokens t
+		 JOIN users u ON u.id = t.user_id
+		 WHERE t.token = ?`,
+		token).Scan(&username, &expiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errors.New("invalid token")
+		}
+		return "", fmt.Errorf("query token: %w", err)
+	}
+
+	if time.Now().Unix() > expiresAt {
+		_, _ = appDB.ExecContext(ctx,
+			`DELETE FROM tokens WHERE token = ?`, token)
+		return "", errors.New("token expired")
+	}
+	return username, nil
+}
+
+func newTokenString(nbytes int) (string, error) {
+	b := make([]byte, nbytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("rand: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
