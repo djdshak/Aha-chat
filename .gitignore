@@ -1,0 +1,6 @@
+
+# local database files
+*.db
+*.db-shm
+*.db-wal
+*.db.bak*
