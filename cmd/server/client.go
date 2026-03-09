@@ -44,43 +44,28 @@ func (c *Client) readPump() {
 		case "msg":
 			now := time.Now().Unix()
 
-			// 1) 基本清洗
 			to := strings.TrimSpace(in.To)
 			text := strings.TrimSpace(in.Text)
 			msgID := strings.TrimSpace(in.MsgID)
 
-			// 2) 最小 ACK 版本：要求客户端带 msg_id
+			// 1) 校验
 			if msgID == "" {
-				_ = c.enqueueJSON(WSOut{
-					Type: "error",
-					Text: "missing msg_id",
-					Ts:   now,
-				})
+				_ = c.enqueueJSON(WSOut{Type: "error", Text: "missing msg_id", Ts: now})
 				continue
 			}
-
+			if to == "" {
+				_ = c.enqueueJSON(WSOut{Type: "error", MsgID: msgID, Text: "missing to (use @username msg or /chat <peer>)", Ts: now})
+				continue
+			}
 			if text == "" {
-				_ = c.enqueueJSON(WSOut{
-					Type:  "error",
-					MsgID: msgID,
-					Text:  "empty text",
-					Ts:    now,
-				})
+				_ = c.enqueueJSON(WSOut{Type: "error", MsgID: msgID, Text: "empty text", Ts: now})
 				continue
 			}
 
-			// 3) 先回 server_received ACK（表示服务器已收到并解析）
-			_ = c.enqueueJSON(WSOut{
-				Type:  "ack", // <- 修正为 ack
-				MsgID: msgID,
-				Ack:   "server_received",
-				To:    to,
-				Ts:    now,
-			})
-
-			// 先落库（幂等）
-			_, inserted, err := StoreTextMessage(
-				context.Background(),
+			// 2) 先落库（幂等）
+			// 用当前请求/连接的 ctx（更规范）
+			rowID, inserted, err := StoreTextMessage(
+				context.Background(), // 如果你这里拿不到 r，就用 context.Background() 或给 Client 带一个 ctx
 				msgID,
 				c.username,
 				to,
@@ -88,16 +73,21 @@ func (c *Client) readPump() {
 				now,
 			)
 			if err != nil {
-				_ = c.enqueueJSON(WSOut{
-					Type:  "error",
-					MsgID: msgID,
-					Text:  "db insert failed",
-					Ts:    time.Now().Unix(),
-				})
+				_ = c.enqueueJSON(WSOut{Type: "error", MsgID: msgID, Text: "db insert failed: " + err.Error(), Ts: now})
 				continue
 			}
+			_ = rowID // 如果暂时用不上，避免 unused（或你直接删掉 rowID）
 
-			// 4) 组装真正消息（发给接收方，也给发送者回显）
+			// 3) db 成功后再回 server_received
+			_ = c.enqueueJSON(WSOut{
+				Type:  "ack",
+				MsgID: msgID,
+				Ack:   "server_received",
+				To:    to,
+				Ts:    now,
+			})
+
+			// 4) 组装消息（回显 + 发给对方）
 			out := WSOut{
 				Type:  "msg",
 				MsgID: msgID,
@@ -106,21 +96,18 @@ func (c *Client) readPump() {
 				Text:  text,
 				Ts:    now,
 			}
-			if !inserted {
-				continue
-			}
-
 			b, _ := json.Marshal(out)
 
-			// 5) 发给发送者自己回显（UI 可立即显示）
+			// 5) 发给发送者自己回显（立即显示）
 			select {
 			case c.send <- b:
 			default:
 			}
 
-			// 6) 如果没填 to，仍走广播
-			if out.To == "" {
-				c.hub.broadcast <- b
+			// 6) 若是重复 msg_id（幂等重发）：不重复投递给对方
+			if !inserted {
+				// 可以选择给个提示，也可以不提示
+				// _ = c.enqueueJSON(WSOut{Type:"info", MsgID: msgID, Text:"duplicate msg_id ignored", Ts: now})
 				continue
 			}
 
@@ -129,16 +116,17 @@ func (c *Client) readPump() {
 				MsgID: msgID,
 				Ack:   "delivered",
 				To:    to,
-				Ts:    time.Now().Unix(),
+				Ts:    now,
 			})
 
 			offlineErr, _ := json.Marshal(WSOut{
 				Type:  "error",
 				MsgID: msgID,
 				Text:  "user offline: " + to,
-				Ts:    time.Now().Unix(),
+				Ts:    now,
 			})
 
+			// 7) 交给 hub 投递；hub 内部决定在线/离线
 			c.hub.sendTo <- sendReq{
 				to:        to,
 				msg:       b,
